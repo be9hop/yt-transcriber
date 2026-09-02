@@ -1,0 +1,6 @@
+# Normalize line endings: repo stores LF (Linux Docker build), Windows checkouts native
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+Dockerfile text eol=lf

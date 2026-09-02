@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+cookies.txt
+*cookies*.txt
+.git/
+.pytest_cache/
+*.sqlite3*
+tests/
+README.md
