@@ -160,6 +160,44 @@ def test_ordered_candidates_requested_stays_in_family_exact_first():
     assert Track("fr", "manual") not in ordered
 
 
+def test_ordered_candidates_original_language_heads_pool():
+    tracks = [Track("es", "auto"), Track("en", "auto"), Track("ak", "auto")]
+    assert ordered_candidates(tracks, None, original_language="es")[0] == Track("es", "auto")
+    # None keeps the default English preference
+    assert ordered_candidates(tracks, None)[0] == Track("en", "auto")
+    # family-reduced: 'en-US' matches base 'en'
+    assert ordered_candidates(tracks, None, original_language="en-US")[0] == Track("en", "auto")
+
+
+def test_ordered_candidates_original_language_prefix_family():
+    tracks = [Track("en", "auto"), Track("pt-BR", "auto")]
+    assert ordered_candidates(tracks, None, original_language="pt")[0] == Track("pt-BR", "auto")
+    assert ordered_candidates(tracks, None, original_language="pt-BR")[0] == Track("pt-BR", "auto")
+    # original language absent from the pool -> default order, never an error
+    assert ordered_candidates(tracks, None, original_language="zz")[0] == Track("en", "auto")
+
+
+def test_original_language_does_not_break_manual_beats_auto():
+    # any manual still beats any auto, even when the original language
+    # matches an auto track (preference applies only inside the pool)
+    tracks = [Track("es", "auto"), Track("fr", "manual")]
+    ordered = ordered_candidates(tracks, None, original_language="es")
+    assert ordered[0] == Track("fr", "manual")
+    assert ordered[1] == Track("es", "auto")
+
+
+def test_original_language_ignored_when_requested():
+    tracks = [Track("es", "auto"), Track("de", "auto")]
+    assert ordered_candidates(tracks, "de", original_language="es") == [Track("de", "auto")]
+    assert select_track(tracks, "de", original_language="es") == Track("de", "auto")
+
+
+def test_select_track_passes_original_language():
+    tracks = [Track("es", "auto"), Track("en", "auto")]
+    assert select_track(tracks, None, original_language="es") == Track("es", "auto")
+    assert select_track(tracks, None) == Track("en", "auto")
+
+
 # ----------------------------------------------------------------------
 # Empty-track fallthrough (faked upstreams, no network)
 # ----------------------------------------------------------------------
@@ -179,6 +217,15 @@ Hallo Welt
 
 00:00:02.000 --> 00:00:04.000
 Zweite Zeile
+"""
+
+ES_VTT = """WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+Hola mundo
+
+00:00:02.000 --> 00:00:04.000
+Segunda linea
 """
 
 YTDLP_INFO = {
@@ -302,6 +349,86 @@ def test_ytdlp_all_candidates_download_error_maps_error(monkeypatch):
     assert "simulated per-track failure" in excinfo.value.message
 
 
+def test_ytdlp_bot_check_error_aborts_candidates_immediately(monkeypatch):
+    # A session-wide bot-check DownloadError must NOT fall through to the
+    # next candidate: further attempts hammer a throttled YouTube and can
+    # return a silent wrong-language transcript. Abort with the mapped
+    # upstream error on the first occurrence.
+    attempts = []
+
+    class _BotCheckYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            if download:
+                attempts.append(self.opts["subtitleslangs"][0])
+                raise yt_dlp.utils.DownloadError(
+                    "ERROR: [youtube] abc12345678: Sign in to confirm you're not a bot. "
+                    "Use --cookies-from-browser or pass the --cookies option"
+                )
+            return super().extract_info(url, download)
+
+    _BotCheckYoutubeDL.vtt_by_lang = {"en": MANUAL_VTT, "de": DE_VTT}
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _BotCheckYoutubeDL)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert excinfo.value.code == "upstream_error"
+    assert excinfo.value.http_status == 502
+    # bot-check mapping (cookies hint), not the generic yt-dlp failure text
+    assert "YOUTUBE_COOKIES_FILE" in excinfo.value.message
+    assert attempts == ["en"]  # no fall-through to candidate 2 ('de')
+
+
+def test_ytdlp_track_specific_http_error_falls_through(monkeypatch):
+    # A NON-session DownloadError on one candidate keeps the resilience
+    # behavior: remember it as terminal, try the next candidate, succeed.
+    class _Http404YoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            if download and self.opts["subtitleslangs"][0] == "en":
+                raise yt_dlp.utils.DownloadError(
+                    "unable to download video subtitles: HTTP 404"
+                )
+            return super().extract_info(url, download)
+
+    _Http404YoutubeDL.vtt_by_lang = {"en": MANUAL_VTT, "de": DE_VTT}
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _Http404YoutubeDL)
+    result = captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert result.language == "de"  # en errored -> de was still tried and won
+    assert [s.text for s in result.segments] == ["Hallo Welt", "Zweite Zeile"]
+
+
+def test_ytdlp_original_language_from_info_heads_selection(monkeypatch):
+    # info['language'] is threaded into default selection: the video's own
+    # language beats the default en-first preference.
+    class _InfoYoutubeDL(_FakeYoutubeDL):
+        info_overrides: dict = {}
+
+        def extract_info(self, url, download=False):
+            if not download:
+                info = dict(YTDLP_INFO)
+                info.update(type(self).info_overrides)
+                return info
+            return super().extract_info(url, download)
+
+    _InfoYoutubeDL.vtt_by_lang = {"es": ES_VTT, "en": MANUAL_VTT}
+    _InfoYoutubeDL.info_overrides = {
+        "language": "es",
+        "subtitles": {"es": [{"ext": "vtt"}], "en": [{"ext": "vtt"}]},
+        "automatic_captions": {},
+    }
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _InfoYoutubeDL)
+    result = captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert result.language == "es"  # original language beats en preference
+
+    # family-reduced: info language 'en-US' matches the en track's base
+    _InfoYoutubeDL.info_overrides = {"language": "en-US"}
+    result = captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert result.language == "en"
+
+    # missing language metadata -> default en preference, no error
+    _InfoYoutubeDL.info_overrides = {}
+    result = captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert result.language == "en"
+
+
 def test_all_ytdlp_tracks_empty_falls_through_to_yta(monkeypatch):
     _FakeYoutubeDL.vtt_by_lang = {"en": EMPTY_VTT, "de": EMPTY_VTT}
     monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _FakeYoutubeDL)
@@ -352,6 +479,240 @@ def test_yta_whitespace_only_snippets_is_no_captions(monkeypatch):
     assert excinfo.value.code == "no_captions"
 
 
+def test_yta_request_blocked_aborts_candidates_immediately(monkeypatch):
+    # RequestBlocked is session-wide (bot check / rate limit): every further
+    # candidate would be blocked too, so map + raise on the first attempt.
+    attempts = []
+
+    class RequestBlocked(Exception):
+        pass
+
+    class _YTA:
+        def list(self, video_id):
+            return [_FakeTranscript("en", True), _FakeTranscript("de", True)]
+
+        def fetch(self, video_id, languages=None):
+            attempts.append(languages)
+            raise RequestBlocked("429: Too Many Requests")
+
+    monkeypatch.setattr(captions_mod, "YouTubeTranscriptApi", _YTA)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_yta("abc12345678", None)
+    assert excinfo.value.code == "upstream_error"
+    assert excinfo.value.http_status == 502
+    assert "blocked" in excinfo.value.message
+    assert attempts == [["en"]]  # no fall-through to 'de'
+
+
+def test_yta_non_blocked_per_track_error_falls_through(monkeypatch):
+    # Non-blocked per-track errors keep the record-and-continue resilience.
+    class _SomeTrackError(Exception):
+        pass
+
+    class _YTA:
+        def list(self, video_id):
+            return [_FakeTranscript("en", True), _FakeTranscript("de", True)]
+
+        def fetch(self, video_id, languages=None):
+            if languages == ["en"]:
+                raise _SomeTrackError("transient per-track failure")
+            return _fetched([_FakeSnippet(0.0, 1.0, "hallo")], "de", True)
+
+    monkeypatch.setattr(captions_mod, "YouTubeTranscriptApi", _YTA)
+    result = captions_mod._fetch_via_yta("abc12345678", None)
+    assert result.language == "de"
+    assert [s.text for s in result.segments] == ["hallo"]
+
+
+# ----------------------------------------------------------------------
+# Candidate-loop wall-time budget (deterministic fake clock)
+# ----------------------------------------------------------------------
+
+MANY_LANGS = ["aa", "bb", "cc", "dd", "ee", "ff", "gg"]
+
+
+class _FakeTime:
+    """Stand-in for the time module as captions uses it (monotonic only)."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def spend(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _many_track_info() -> dict:
+    # Phase-1 info listing 7 manual tracks (none English) -> 7 candidates.
+    info = dict(YTDLP_INFO)
+    info["subtitles"] = {code: [{"ext": "vtt"}] for code in MANY_LANGS}
+    return info
+
+
+def test_ytdlp_deadline_stops_per_track_error_loop(monkeypatch):
+    # Budget = max(30, timeout=60) = 60s of fake time; each failed attempt
+    # burns 18s -> attempts at t=0/18/36/54, then t=72 >= 60 breaks the loop
+    # after 4 of the 7 candidates instead of running unbounded.
+    fake_time = _FakeTime()
+    attempts = []
+
+    class _SlowAllFailYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            if not download:
+                return _many_track_info()
+            attempts.append(self.opts["subtitleslangs"][0])
+            fake_time.spend(18.0)
+            raise yt_dlp.utils.DownloadError("simulated per-track failure")
+
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _SlowAllFailYoutubeDL)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert excinfo.value.code == "upstream_error"
+    assert excinfo.value.http_status == 502
+    assert "simulated per-track failure" in excinfo.value.message
+    assert len(attempts) == 4  # bounded: fewer than all 7 candidates
+
+
+def test_ytdlp_deadline_stops_empty_track_loop(monkeypatch):
+    # Every candidate yields an empty-but-valid VTT; the budget must stop the
+    # loop and no_captions must mention the time budget instead of hanging.
+    fake_time = _FakeTime()
+    attempts = []
+
+    class _SlowEmptyYoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            if not download:
+                return _many_track_info()
+            lang = self.opts["subtitleslangs"][0]
+            attempts.append(lang)
+            fake_time.spend(18.0)
+            path = self.opts["outtmpl"].replace("%(id)s", "abc12345678").replace(
+                "%(ext)s", f"{lang}.vtt"
+            )
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(EMPTY_VTT)  # valid header, zero usable cues
+            return {}
+
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _SlowEmptyYoutubeDL)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert excinfo.value.code == "no_captions"
+    assert "time budget" in excinfo.value.message
+    assert len(attempts) == 4  # bounded: fewer than all 7 candidates
+
+
+def test_yta_deadline_stops_per_track_error_loop(monkeypatch):
+    fake_time = _FakeTime()
+    attempts = []
+
+    class _YTA:
+        def list(self, video_id):
+            return [_FakeTranscript(code, True) for code in MANY_LANGS]
+
+        def fetch(self, video_id, languages=None):
+            attempts.append(languages[0])
+            fake_time.spend(18.0)
+            raise ValueError("transient per-track failure")
+
+    monkeypatch.setattr(captions_mod, "YouTubeTranscriptApi", _YTA)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_yta("abc12345678", None)
+    assert excinfo.value.code == "upstream_error"
+    assert excinfo.value.http_status == 502
+    assert "transient per-track failure" in excinfo.value.message
+    assert len(attempts) == 4  # bounded: fewer than all 7 candidates
+
+
+def test_yta_deadline_stops_empty_snippet_loop(monkeypatch):
+    fake_time = _FakeTime()
+    attempts = []
+
+    class _YTA:
+        def list(self, video_id):
+            return [_FakeTranscript(code, True) for code in MANY_LANGS]
+
+        def fetch(self, video_id, languages=None):
+            attempts.append(languages[0])
+            fake_time.spend(18.0)
+            return _fetched([], languages[0], True)  # parses to zero snippets
+
+    monkeypatch.setattr(captions_mod, "YouTubeTranscriptApi", _YTA)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    with pytest.raises(AppError) as excinfo:
+        captions_mod._fetch_via_yta("abc12345678", None)
+    assert excinfo.value.code == "no_captions"
+    assert "time budget" in excinfo.value.message
+    assert len(attempts) == 4  # bounded: fewer than all 7 candidates
+
+
+class _SuspendBeforeFirstCheckClock(_FakeTime):
+    """Fake clock whose second monotonic() read jumps past any budget.
+
+    Models a process suspension between the deadline computation (first
+    read) and the candidate loop's first deadline check (second read).
+    """
+
+    def __init__(self, jump: float):
+        super().__init__()
+        self.jump = jump
+        self._reads = 0
+
+    def monotonic(self) -> float:
+        self._reads += 1
+        if self._reads == 2:
+            self.now += self.jump
+        return self.now
+
+
+def test_ytdlp_first_candidate_attempted_when_clock_jumps_before_first_check(monkeypatch):
+    # A suspension between the deadline computation and the first loop-top
+    # check must not deadline-skip candidate #1: it is attempted exactly
+    # once and its result is honored.
+    fake_time = _SuspendBeforeFirstCheckClock(jump=1000.0)
+    attempts = []
+
+    class _SuspendPhase1YoutubeDL(_FakeYoutubeDL):
+        def extract_info(self, url, download=False):
+            if not download:
+                return _many_track_info()
+            attempts.append(self.opts["subtitleslangs"][0])
+            return super().extract_info(url, download=download)
+
+    _SuspendPhase1YoutubeDL.vtt_by_lang = {"aa": DE_VTT}  # first candidate succeeds
+    monkeypatch.setattr(captions_mod.yt_dlp, "YoutubeDL", _SuspendPhase1YoutubeDL)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    result = captions_mod._fetch_via_ytdlp("abc12345678", None, 60, None)
+    assert attempts == ["aa"]  # exactly one candidate attempted, none skipped
+    assert result.engine == ENGINE_YTDLP
+    assert result.language == "aa"
+    assert [s.text for s in result.segments] == ["Hallo Welt", "Zweite Zeile"]
+
+
+def test_yta_first_candidate_attempted_when_clock_jumps_before_first_check(monkeypatch):
+    fake_time = _SuspendBeforeFirstCheckClock(jump=1000.0)
+    attempts = []
+
+    class _YTA:
+        def list(self, video_id):
+            return [_FakeTranscript(code, True) for code in MANY_LANGS]
+
+        def fetch(self, video_id, languages=None):
+            attempts.append(languages[0])
+            return _fetched([_FakeSnippet(0.0, 1.0, "hallo")], languages[0], True)
+
+    monkeypatch.setattr(captions_mod, "YouTubeTranscriptApi", _YTA)
+    monkeypatch.setattr(captions_mod, "time", fake_time)
+    result = captions_mod._fetch_via_yta("abc12345678", None)
+    assert attempts == ["aa"]  # exactly one candidate attempted, none skipped
+    assert result.language == "aa"
+    assert [s.text for s in result.segments] == ["hallo"]
+
+
 # ----------------------------------------------------------------------
 # Fallback error attribution (cookies hint accuracy)
 # ----------------------------------------------------------------------
@@ -363,7 +724,7 @@ def test_terminal_yta_error_does_not_mention_cookies(monkeypatch):
             "YouTube is requiring verification. Export cookies and set YOUTUBE_COOKIES_FILE.",
         )
 
-    def fake_yta(video_id, lang):
+    def fake_yta(video_id, lang, timeout=60):
         raise AppError(
             "upstream_error", 502,
             "YouTube blocked the caption request (bot check / rate limit).",
@@ -382,7 +743,7 @@ def test_definitive_ytdlp_error_survives_yta_failure(monkeypatch):
     def fake_ytdlp(video_id, lang, timeout, cookies):
         raise AppError("video_unavailable", 404, "The video is unavailable or does not exist.")
 
-    def fake_yta(video_id, lang):
+    def fake_yta(video_id, lang, timeout=60):
         raise AppError("upstream_error", 502, "youtube-transcript-api failed: blocked")
 
     monkeypatch.setattr(captions_mod, "_fetch_via_ytdlp", fake_ytdlp)

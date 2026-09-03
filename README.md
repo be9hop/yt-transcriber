@@ -242,6 +242,9 @@ pip install -U yt-dlp
 ## Limitations & roadmap
 
 - Captionless videos fail with `422 no_captions` — there is no ASR in v1.
+- When YouTube throttles or bot-checks a request, the API returns
+  `502 upstream_error` (retry later / set `YOUTUBE_COOKIES_FILE`) rather than
+  silently returning a wrong-language transcript from a mid-request fallback.
 - Auto-generated captions are cleaned of rolling-window duplication, but the
   cleaning is heuristic; occasional artifacts remain.
 - No job queue: requests are synchronous and fast (seconds).

@@ -11,6 +11,7 @@ import html
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 
 import yt_dlp
@@ -20,6 +21,13 @@ from app.errors import AppError
 
 ENGINE_YTDLP = "yt-dlp"
 ENGINE_YTA = "youtube-transcript-api"
+
+# Overall wall-time budget floor for the per-track candidate loops:
+# socket_timeout bounds each individual network call, not the loop, and a
+# video with hundreds of auto tracks that each error or parse empty could
+# otherwise keep a request occupied for many minutes. The floor keeps a sane
+# budget even when a caller passes a very small request_timeout.
+_MIN_CANDIDATE_BUDGET_SECONDS = 30
 
 
 @dataclass
@@ -188,6 +196,12 @@ def _norm(code: str | None) -> str:
     return (code or "").strip().lower().replace("_", "-")
 
 
+def _base(code: str | None) -> str | None:
+    """Language base subtag: 'en-US' -> 'en', None/'' -> None."""
+    base = _norm(code).split("-", 1)[0]
+    return base or None
+
+
 def _pick(tracks: list[Track]) -> Track:
     return sorted(tracks, key=_pick_key)[0]
 
@@ -196,7 +210,11 @@ def _pick_key(track: Track) -> tuple[int, str]:
     return (0 if track.kind == "manual" else 1, _norm(track.language_code))
 
 
-def ordered_candidates(tracks: list[Track], requested: str | None) -> list[Track]:
+def ordered_candidates(
+    tracks: list[Track],
+    requested: str | None,
+    original_language: str | None = None,
+) -> list[Track]:
     """All tracks, best-first, for engines that skip unusable tracks.
 
     Same fallback order as documented below, but every track is returned so
@@ -206,6 +224,14 @@ def ordered_candidates(tracks: list[Track], requested: str | None) -> list[Track
     is empty there is no fallback -> no_such_language. With no requested
     language: any manual (English preferred) before any auto (English
     preferred), alphabetical within each group.
+
+    `original_language` (the video's own language, normalized and
+    family-reduced: 'en-US' matches base 'en' and any 'en-*' track) only
+    matters when no language is requested: within the manual-or-auto pool,
+    a track from the original language's family becomes the head, beating
+    the default English preference. It never raises; unknown values just
+    leave the English-first, then alphabetical order. Manual tracks still
+    beat auto tracks regardless of `original_language`.
     """
     if not tracks:
         raise AppError("no_captions", 422, "This video has no caption tracks available.")
@@ -232,9 +258,23 @@ def ordered_candidates(tracks: list[Track], requested: str | None) -> list[Track
 
     manual = [t for t in tracks if t.kind == "manual"]
     pool = manual or list(tracks)  # any manual, else any auto
-    english = [t for t in pool if _norm(t.language_code) == "en"]
-    english = english or [t for t in pool if _norm(t.language_code).startswith("en-")]
-    head = _pick(english or sorted(pool, key=lambda t: _norm(t.language_code)))
+    orig = _base(original_language) if original_language else None
+    head_pool: list[Track] | None = None
+    if orig:
+        orig_family = [
+            t
+            for t in pool
+            if _norm(t.language_code) == orig
+            or _norm(t.language_code).startswith(orig + "-")
+        ]
+        if orig_family:
+            head_pool = orig_family
+    if head_pool is None:
+        # Default preference: 'en' exact, then any 'en-*', then alphabetical.
+        english = [t for t in pool if _norm(t.language_code) == "en"]
+        english = english or [t for t in pool if _norm(t.language_code).startswith("en-")]
+        head_pool = english or sorted(pool, key=lambda t: _norm(t.language_code))
+    head = _pick(head_pool)
     rest = sorted(
         (t for t in tracks if t is not head),
         key=lambda t: (0 if t.kind == "manual" else 1, _norm(t.language_code)),
@@ -242,16 +282,22 @@ def ordered_candidates(tracks: list[Track], requested: str | None) -> list[Track
     return [head] + rest
 
 
-def select_track(tracks: list[Track], requested: str | None) -> Track:
+def select_track(
+    tracks: list[Track],
+    requested: str | None,
+    original_language: str | None = None,
+) -> Track:
     """Best single track (the head of `ordered_candidates`).
 
     Fallback order: requested exact -> prefix -> any manual -> any auto.
-    Deterministic: manual beats auto on ties, 'en' beats other languages,
-    then alphabetical. With a requested language, the whole chain is scoped
-    to that language family (exact, then prefix like 'en' <-> 'en-US'); if
-    nothing in the family exists there is no fallback -> no_such_language.
+    Deterministic: manual beats auto on ties, the video's original language
+    (see `ordered_candidates`) beats the default 'en' preference, 'en' beats
+    other languages, then alphabetical. With a requested language, the whole
+    chain is scoped to that language family (exact, then prefix like
+    'en' <-> 'en-US') and `original_language` is ignored; if nothing in the
+    family exists there is no fallback -> no_such_language.
     """
-    return ordered_candidates(tracks, requested)[0]
+    return ordered_candidates(tracks, requested, original_language)[0]
 
 
 # --------------------------------------------------------------------------
@@ -276,21 +322,32 @@ def _yt_dlp_opts(timeout: int, cookies_file: str | None, **extra) -> dict:
     return opts
 
 
-def _map_ytdlp_error(exc: Exception) -> AppError:
-    msg = str(exc)
-    low = msg.lower()
-    if (
+def _is_session_wide_download_error(exc: Exception) -> bool:
+    """True for bot-check/throttle errors that affect the whole session.
+
+    These are not per-track failures: every candidate attempt would hit the
+    same block (and hammering YouTube during a throttle makes it worse),
+    so the candidate loop must abort instead of falling through.
+    """
+    low = str(exc).lower()
+    return (
         "sign in to confirm" in low
         or "not a bot" in low
         or "bot check" in low
         or "http error 429" in low
         or "too many requests" in low
-    ):
+    )
+
+
+def _map_ytdlp_error(exc: Exception) -> AppError:
+    msg = str(exc)
+    if _is_session_wide_download_error(exc):
         return AppError(
             "upstream_error", 502,
             "YouTube is requiring verification for this request (bot check / HTTP 429). "
             "Export cookies to a Netscape file and set YOUTUBE_COOKIES_FILE, then retry.",
         )
+    low = msg.lower()
     if (
         "video unavailable" in low
         or "private video" in low
@@ -335,20 +392,35 @@ def _fetch_via_ytdlp(video_id: str, lang: str | None, timeout: int, cookies_file
     info = _extract_info(url, timeout, cookies_file)
 
     tracks = _tracks_from_dicts(info.get("subtitles") or {}, info.get("automatic_captions") or {})
-    candidates = ordered_candidates(tracks, lang)  # raises no_captions / no_such_language
+    # The video's own language (e.g. info['language']='en-US' -> base 'en')
+    # steers default selection; missing/None keeps the English preference.
+    original_language = _base(info.get("language"))
+    candidates = ordered_candidates(tracks, lang, original_language)  # raises no_captions / no_such_language
 
     # Phase 2: fetch exactly one VTT per candidate until one yields a real
     # transcript. Setting the write flags per kind also avoids manual/auto
     # filename collisions. A track that parses/cleans to zero segments is
     # malformed upstream output, NOT a transcript — skip it and try the next
-    # candidate (and ultimately the next engine). Same for a per-track
-    # DownloadError: remember the first one as terminal and keep trying the
-    # remaining candidates (mirrors the yta loop below); only map/raise it
-    # when every candidate is exhausted.
+    # candidate (and ultimately the next engine). A per-track DownloadError
+    # is remembered as terminal and the remaining candidates are tried
+    # (mirrors the yta loop below); only map/raise it when every candidate
+    # is exhausted. A session-wide DownloadError (bot check / throttle) is
+    # different: every candidate would hit the same block, and hammering
+    # YouTube mid-throttle can produce a silent WRONG-LANGUAGE success —
+    # so it aborts the loop immediately with the mapped upstream error.
     terminal: yt_dlp.utils.DownloadError | None = None
+    timed_out = False
+    # Wall-time budget for the whole loop, not just one extract_info call.
+    # Enforced only from the second candidate on: a process suspension
+    # between the deadline computation and the first loop-top check must
+    # still give the first (best) candidate its one attempt.
+    deadline = time.monotonic() + max(_MIN_CANDIDATE_BUDGET_SECONDS, timeout)
     with tempfile.TemporaryDirectory(prefix="yt-transcriber-") as tmp:
         pattern = os.path.join(glob.escape(tmp), f"{video_id}.*.vtt")
-        for track in candidates:
+        for index, track in enumerate(candidates):
+            if index > 0 and time.monotonic() >= deadline:
+                timed_out = True
+                break  # time budget spent; report what the loop established
             for stale in glob.glob(pattern):
                 os.remove(stale)  # never confuse a previous candidate's file
 
@@ -364,6 +436,8 @@ def _fetch_via_ytdlp(video_id: str, lang: str | None, timeout: int, cookies_file
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.extract_info(url, download=True)
             except yt_dlp.utils.DownloadError as exc:
+                if _is_session_wide_download_error(exc):
+                    raise _map_ytdlp_error(exc) from exc  # throttle: abort now
                 terminal = terminal or exc
                 continue  # per-track failure -> try the next candidate
 
@@ -396,7 +470,8 @@ def _fetch_via_ytdlp(video_id: str, lang: str | None, timeout: int, cookies_file
         raise _map_ytdlp_error(terminal) from terminal
     raise AppError(
         "no_captions", 422,
-        "Caption tracks exist but none of them contained usable text.",
+        "Caption tracks exist but none of them contained usable text"
+        + (" (search stopped after the time budget)." if timed_out else "."),
     )
 
 
@@ -423,7 +498,7 @@ def _map_yta_error(exc: Exception) -> AppError:
     return AppError("upstream_error", 502, f"youtube-transcript-api failed: {msg[:300]}")
 
 
-def _fetch_via_yta(video_id: str, lang: str | None) -> CaptionResult:
+def _fetch_via_yta(video_id: str, lang: str | None, timeout: int = 60) -> CaptionResult:
     try:
         ytt = YouTubeTranscriptApi()
         tracks = [
@@ -436,12 +511,26 @@ def _fetch_via_yta(video_id: str, lang: str | None) -> CaptionResult:
     candidates = ordered_candidates(tracks, lang)  # raises no_captions / no_such_language
 
     terminal: Exception | None = None
-    for track in candidates:
+    timed_out = False
+    # Wall-time budget for the whole loop (mirrors the yt-dlp loop above).
+    # Enforced only from the second candidate on (same reasoning there): a
+    # suspension before the first check must not skip the first candidate.
+    deadline = time.monotonic() + max(_MIN_CANDIDATE_BUDGET_SECONDS, timeout)
+    for index, track in enumerate(candidates):
+        if index > 0 and time.monotonic() >= deadline:
+            timed_out = True
+            break  # time budget spent; report what the loop established
         try:
             fetched = ytt.fetch(video_id, languages=[track.language_code])
-        except Exception as exc:  # per-track failure -> try the next candidate
+        except Exception as exc:
+            if type(exc).__name__ in ("RequestBlocked", "IpBlocked"):
+                # Session-wide block (bot check / rate limit), not a per-track
+                # failure: every candidate would be blocked the same way, so
+                # abort immediately instead of hammering YouTube for more
+                # tracks (which can yield a wrong-language transcript).
+                raise _map_yta_error(exc) from exc
             terminal = terminal or exc
-            continue
+            continue  # per-track failure -> try the next candidate
 
         segments = [
             Segment(round(s.start, 3), round(s.start + s.duration, 3), _collapse(s.text))
@@ -466,7 +555,8 @@ def _fetch_via_yta(video_id: str, lang: str | None) -> CaptionResult:
         raise _map_yta_error(terminal) from terminal
     raise AppError(
         "no_captions", 422,
-        "Caption tracks exist but none of them contained usable text.",
+        "Caption tracks exist but none of them contained usable text"
+        + (" (search stopped after the time budget)." if timed_out else "."),
     )
 
 
@@ -499,7 +589,7 @@ def fetch_transcript(
             print(f"[yt-dlp] unexpected error: {exc!r}")
 
     try:
-        return _fetch_via_yta(video_id, lang)
+        return _fetch_via_yta(video_id, lang, request_timeout)
     except AppError as yta_error:
         if primary_error is not None and primary_error.code != "upstream_error":
             raise primary_error
